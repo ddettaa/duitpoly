@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from datetime import datetime
 from config.config import DB_PATH
 
@@ -85,6 +86,41 @@ class SQLiteHandler:
                 latency_events_count INTEGER,
                 status TEXT,
                 checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT UNIQUE NOT NULL,
+                market_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                position_size REAL NOT NULL,
+                entry_btc_price REAL,
+                entry_time INTEGER NOT NULL,
+                exit_price REAL,
+                exit_time INTEGER,
+                pnl REAL,
+                reason TEXT,
+                status TEXT DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                action TEXT NOT NULL,
+                confidence REAL,
+                edge REAL,
+                btc_price REAL,
+                polymarket_price REAL,
+                signal_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -221,6 +257,89 @@ class SQLiteHandler:
         conn.commit()
         conn.close()
 
+    def insert_trade(self, trade):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO trades 
+            (trade_id, market_id, action, entry_price, position_size, entry_btc_price, entry_time, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                trade["trade_id"],
+                trade["market_id"],
+                trade["action"],
+                trade["entry_price"],
+                trade["position_size"],
+                trade.get("entry_btc_price", 0),
+                trade["entry_time"],
+                trade.get("status", "open"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_trade(self, trade):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE trades SET
+                exit_price = ?,
+                exit_time = ?,
+                pnl = ?,
+                reason = ?,
+                status = ?
+            WHERE trade_id = ?
+        """,
+            (
+                trade.get("exit_price"),
+                trade.get("exit_time"),
+                trade.get("pnl"),
+                trade.get("reason"),
+                trade.get("status", "closed"),
+                trade["trade_id"],
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def insert_signal(
+        self,
+        market_id,
+        signal_type,
+        priority,
+        action,
+        confidence,
+        edge,
+        btc_price,
+        polymarket_price,
+        signal_data=None,
+    ):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO signals 
+            (market_id, signal_type, priority, action, confidence, edge, btc_price, polymarket_price, signal_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                market_id,
+                signal_type,
+                priority,
+                action,
+                confidence,
+                edge,
+                btc_price,
+                polymarket_price,
+                json.dumps(signal_data) if signal_data else None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
     def get_latency_stats(self):
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -302,6 +421,91 @@ class SQLiteHandler:
             LIMIT ?
         """,
             (limit,),
+        )
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+    def get_open_trades(self):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT trade_id, market_id, action, entry_price, position_size, entry_btc_price, entry_time
+            FROM trades
+            WHERE status = 'open'
+        """)
+        results = cursor.fetchall()
+        conn.close()
+        trades = []
+        for r in results:
+            trades.append(
+                {
+                    "trade_id": r[0],
+                    "market_id": r[1],
+                    "action": r[2],
+                    "entry_price": r[3],
+                    "position_size": r[4],
+                    "entry_btc_price": r[5],
+                    "entry_time": r[6],
+                }
+            )
+        return trades
+
+    def get_trade_stats(self):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+                SUM(pnl) as total_pnl,
+                AVG(pnl) as avg_pnl
+            FROM trades
+            WHERE status = 'closed'
+        """)
+        result = cursor.fetchone()
+        conn.close()
+        return {
+            "total": result[0] or 0,
+            "wins": result[1] or 0,
+            "losses": result[2] or 0,
+            "total_pnl": round(result[3], 2) if result[3] else 0,
+            "avg_pnl": round(result[4], 2) if result[4] else 0,
+        }
+
+    def get_signal_stats(self):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN priority = 'HIGH' THEN 1 ELSE 0 END) as high_priority,
+                SUM(CASE WHEN action LIKE 'buy_yes' THEN 1 ELSE 0 END) as buy_yes,
+                SUM(CASE WHEN action LIKE 'buy_no' THEN 1 ELSE 0 END) as buy_no
+            FROM signals
+        """)
+        result = cursor.fetchone()
+        conn.close()
+        return {
+            "total": result[0] or 0,
+            "high_priority": result[1] or 0,
+            "buy_yes": result[2] or 0,
+            "buy_no": result[3] or 0,
+        }
+
+    def get_historical_prices(self, market_id, limit=100):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT price_yes, btc_price, timestamp_ms
+            FROM price_snapshots
+            WHERE market_id = ?
+            ORDER BY timestamp_ms DESC
+            LIMIT ?
+        """,
+            (market_id, limit),
         )
         results = cursor.fetchall()
         conn.close()

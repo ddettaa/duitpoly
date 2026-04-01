@@ -4,6 +4,7 @@ import time
 import threading
 import signal
 from datetime import datetime
+from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -15,32 +16,54 @@ from src.data_collector.btc_websocket import BTCWebSocket
 from src.latency_detector.latency_analyzer import LatencyDetector
 from src.llm.minimax_client import MiniMaxClient
 from src.monitoring.telegram_bot import TelegramBot
+from src.engine.signal_engine import SignalEngine
+from src.engine.risk_manager import RiskManager
+from src.engine.backtester import Backtester
+from src.engine.paper_trading_engine import PaperTradingEngine
+from src.engine.pro_trading_engine import ProTradingEngine
+
+load_dotenv()
+
+TRADING_MODES = {
+    "FREE": "FREE MODE - Data collection only",
+    "PAPER": "PAPER MODE - Simulated trading",
+    "PRO": "PRO MODE - Live trading with real money",
+}
 
 
 class TradingEngine:
-    def __init__(self):
+    def __init__(self, mode="FREE"):
+        self.mode = mode.upper()
         self.db = SQLiteHandler(DB_PATH)
         self.telegram_bot = None
         self.polymarket_client = None
         self.btc_ws = None
         self.latency_detector = None
         self.llm_client = None
+        self.signal_engine = None
+        self.trading_engine = None
         self.running = False
         self.start_time = time.time()
 
+        print(f"\n{'=' * 60}")
+        print(f"POLYMARKET TRADING ENGINE")
+        print(f"{'=' * 60}")
+        print(f"Mode: {self.mode}")
+        print(f"Description: {TRADING_MODES.get(self.mode, 'Unknown')}")
+        print(f"{'=' * 60}\n")
+
         self._init_components()
-        self._register_signal_handlers()
 
     def _init_components(self):
         print("[Engine] Initializing components...")
 
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            self.telegram_bot = TelegramBot()
+            self.telegram_bot = TelegramBot(
+                bot_token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID
+            )
             print("[Engine] Telegram bot initialized")
         else:
-            print(
-                "[Engine] WARNING: Telegram not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
-            )
+            print("[Engine] WARNING: Telegram not configured")
 
         self.polymarket_client = PolymarketClient()
         print("[Engine] Polymarket client ready")
@@ -56,20 +79,41 @@ class TradingEngine:
             self.llm_client = MiniMaxClient(
                 api_key=minimax_key, telegram_bot=self.telegram_bot
             )
+            self.signal_engine = SignalEngine(
+                llm_client=self.llm_client,
+                latency_detector=self.latency_detector,
+                telegram_bot=self.telegram_bot,
+            )
             print("[Engine] MiniMax client ready")
+            print("[Engine] Signal engine ready")
         else:
-            print("[Engine] WARNING: MiniMax not configured (set MINIMAX_API_KEY)")
+            print("[Engine] WARNING: MiniMax not configured - LLM analysis disabled")
+
+        if self.mode == "PAPER":
+            self.trading_engine = PaperTradingEngine(
+                initial_capital=10000,
+                telegram_bot=self.telegram_bot,
+                minimax_client=self.llm_client,
+            )
+        elif self.mode == "PRO":
+            polymarket_api_key = os.getenv("POLYMARKET_API_KEY", "")
+            polymarket_api_secret = os.getenv("POLYMARKET_API_SECRET", "")
+            self.trading_engine = ProTradingEngine(
+                initial_capital=10,
+                telegram_bot=self.telegram_bot,
+                minimax_client=self.llm_client,
+                api_key=polymarket_api_key,
+                api_secret=polymarket_api_secret,
+            )
+
+        if self.trading_engine:
+            self.signal_engine = SignalEngine(
+                llm_client=self.llm_client,
+                latency_detector=self.latency_detector,
+                telegram_bot=self.telegram_bot,
+            )
 
         print("[Engine] All components initialized")
-
-    def _register_signal_handlers(self):
-        def signal_handler(sig, frame):
-            print("\n[Engine] Shutdown signal received")
-            self.stop()
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
 
     def _on_polymarket_data(self, data):
         try:
@@ -86,12 +130,19 @@ class TradingEngine:
             )
 
             btc_price, btc_ts = self.btc_ws.get_last_price()
-            if btc_price:
-                data_with_btc = data.copy()
-                data_with_btc["btc_price"] = btc_price
+            if btc_price and self.latency_detector:
                 self.latency_detector.check_deviation(
                     {"btc_price": btc_price, "timestamp_ms": btc_ts}, data
                 )
+
+            if self.mode != "FREE" and self.signal_engine and btc_price:
+                signal = self.signal_engine.check_opportunity(
+                    btc_data={"btc_price": btc_price, "timestamp_ms": btc_ts},
+                    polymarket_data=data,
+                )
+
+                if self.mode == "PAPER" and signal["priority"] == "HIGH":
+                    self.trading_engine.execute_signal(signal)
 
         except Exception as e:
             print(f"[Engine] Error processing polymarket data: {e}")
@@ -101,17 +152,16 @@ class TradingEngine:
             self.db.insert_btc_feed(
                 btc_price=data["btc_price"], timestamp_ms=data["timestamp_ms"]
             )
-
         except Exception as e:
             print(f"[Engine] Error processing BTC data: {e}")
 
-    def _slow_analysis_loop(self):
-        print("[Engine] Slow analysis loop started")
+    def _llm_analysis_loop(self):
+        print("[Engine] LLM analysis loop started")
         while self.running:
             try:
                 time.sleep(LLM_ANALYSIS_INTERVAL_MINUTES * 60)
 
-                if not self.llm_client:
+                if not self.llm_client or not self.running:
                     continue
 
                 markets = self.db.get_pending_markets_for_analysis(limit=10)
@@ -148,60 +198,44 @@ class TradingEngine:
 
                         self.llm_client.check_and_alert_opportunity(result)
                         print(
-                            f"[Engine] Analyzed {market_id}: edge={result['edge']:.2%}, action={result['recommended_action']}"
+                            f"[Engine] Analyzed {market_id}: edge={result['edge']:.2%}"
                         )
 
                     time.sleep(2)
 
             except Exception as e:
-                print(f"[Engine] Slow analysis error: {e}")
+                print(f"[Engine] LLM analysis error: {e}")
 
-    def _daily_summary_loop(self):
-        print("[Engine] Daily summary loop started")
-        while self.running:
-            try:
-                while True:
-                    now = datetime.now()
-                    if now.hour == 18 and now.minute == 0:
-                        break
-                    time.sleep(60)
+    def _register_signal_handlers(self):
+        def signal_handler(sig, frame):
+            print("\n[Engine] Shutdown signal received")
+            self.stop()
+            sys.exit(0)
 
-                if self.running and self.telegram_bot:
-                    stats = self.db.get_latency_stats()
-                    self.telegram_bot.send_daily_summary(stats)
-                    print("[Engine] Daily summary sent")
-
-                time.sleep(60)
-
-            except Exception as e:
-                print(f"[Engine] Daily summary error: {e}")
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
     def start(self):
-        print("\n" + "=" * 50)
-        print("POLYMARKET TRADING ENGINE - PHASE 1")
-        print("=" * 50)
-        print(f"[Engine] Starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n[Engine] Starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         self.running = True
 
-        self.polymarket_client.start_polling(callback=self._on_polymarket_data)
-
-        self.btc_ws.start(callback=self._on_btc_data)
-
         if self.telegram_bot:
             self.telegram_bot.send_startup_message()
-            self.telegram_bot.start_health_checker(
-                interval_minutes=60,
-                data_points_func=self.db.get_data_points_count,
-                latency_count_func=self.db.get_latency_events_today,
-            )
 
-        threading.Thread(target=self._slow_analysis_loop, daemon=True).start()
-        threading.Thread(target=self._daily_summary_loop, daemon=True).start()
+        self.polymarket_client.start_polling(callback=self._on_polymarket_data)
+        self.btc_ws.start(callback=self._on_btc_data)
 
-        print("[Engine] All systems started!")
-        print("[Engine] Press Ctrl+C to stop")
-        print("=" * 50 + "\n")
+        if self.mode == "PAPER" or self.mode == "PRO":
+            self.trading_engine.start()
+
+        threading.Thread(target=self._llm_analysis_loop, daemon=True).start()
+
+        print("\n" + "=" * 60)
+        print("SYSTEM STARTED")
+        print("=" * 60)
+        print("Press Ctrl+C to stop")
+        print("=" * 60 + "\n")
 
         try:
             while self.running:
@@ -212,6 +246,9 @@ class TradingEngine:
     def stop(self):
         print("\n[Engine] Stopping...")
         self.running = False
+
+        if self.trading_engine:
+            self.trading_engine.stop()
 
         self.polymarket_client.stop_polling()
         self.btc_ws.stop()
@@ -225,17 +262,41 @@ class TradingEngine:
         uptime = time.time() - self.start_time
         data_points = self.db.get_data_points_count()
         latency_stats = self.db.get_latency_stats()
+        signal_stats = self.db.get_signal_stats() if self.mode != "FREE" else {}
 
-        return {
+        status = {
+            "mode": self.mode,
             "running": self.running,
             "uptime_seconds": uptime,
             "data_points": data_points,
             "latency_stats": latency_stats,
+            "signal_stats": signal_stats,
         }
+
+        if self.trading_engine:
+            status["trading_metrics"] = self.trading_engine.get_metrics()
+
+        return status
 
 
 def main():
-    engine = TradingEngine()
+    mode = os.getenv("TRADING_MODE", "FREE").upper()
+
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].upper()
+
+    if mode not in TRADING_MODES:
+        print(f"Invalid mode: {mode}")
+        print(f"Available modes: {', '.join(TRADING_MODES.keys())}")
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print("POLYMARKET TRADING ENGINE")
+    print("=" * 60)
+    print(f"Starting in {mode} mode...")
+    print("=" * 60 + "\n")
+
+    engine = TradingEngine(mode=mode)
     engine.start()
 
 
