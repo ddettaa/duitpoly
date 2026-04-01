@@ -1213,4 +1213,4 @@ This project is for **educational purposes only**. Use at your own risk. The aut
 
 **Version:** 1.0.0  
 **Last Updated:** 2026-04-01  
-**Author:** Polymarket Trading Engine Team
+**Author:** ddettaa
