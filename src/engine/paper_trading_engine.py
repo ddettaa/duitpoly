@@ -9,11 +9,17 @@ from config.config import LLM_ANALYSIS_INTERVAL_MINUTES
 
 
 class PaperTradingEngine:
-    def __init__(self, initial_capital=10000, telegram_bot=None, minimax_client=None):
+    def __init__(
+        self,
+        initial_capital=10000,
+        telegram_bot=None,
+        minimax_client=None,
+        signal_engine=None,
+    ):
         self.mode = "PAPER"
         self.telegram_bot = telegram_bot
         self.risk_manager = RiskManager(initial_capital=initial_capital)
-        self.signal_engine = SignalEngine(telegram_bot=telegram_bot)
+        self.signal_engine = signal_engine or SignalEngine(telegram_bot=telegram_bot)
         self.llm_client = minimax_client
         self.running = False
         self.start_time = time.time()
@@ -75,19 +81,22 @@ class PaperTradingEngine:
                         )
 
                         if should_exit:
-                            self.risk_manager.close_trade(
+                            closed_trade = self.risk_manager.close_trade(
                                 trade_id=trade["trade_id"],
                                 exit_price=current_price,
                                 reason=reason,
                             )
 
-                            if self.telegram_bot:
+                            if self.telegram_bot and closed_trade:
+                                pnl = closed_trade.get("pnl", 0)
+                                emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
                                 self.telegram_bot.send_message(
-                                    f"[PAPER TRADE CLOSED]\n"
-                                    f"Market: {market_id}\n"
-                                    f"Reason: {reason}\n"
-                                    f"Entry: {entry_price}\n"
-                                    f"Exit: {current_price}"
+                                    f"{emoji} *[PAPER TRADE CLOSED]*\n\n"
+                                    f"`{market_id}`\n"
+                                    f"Reason: `{reason}`\n"
+                                    f"Entry: `{entry_price:.4f}`\n"
+                                    f"Exit: `{current_price:.4f}`\n"
+                                    f"*P&L: `${pnl:.2f}`*"
                                 )
 
             except Exception as e:
@@ -196,7 +205,9 @@ class PaperTradingEngine:
         return self.risk_manager.get_metrics()
 
     def execute_signal(self, signal):
-        if signal["action"] == "no_trade" or signal["priority"] != "HIGH":
+        if signal["action"] == "no_trade":
+            return None
+        if signal["priority"] not in ("HIGH", "MEDIUM"):
             return None
 
         market_id = signal["market_id"]
@@ -229,11 +240,12 @@ class PaperTradingEngine:
 
         if trade and self.telegram_bot:
             self.telegram_bot.send_message(
-                f"[PAPER TRADE OPENED]\n"
-                f"Market: {market_id}\n"
-                f"Action: {action}\n"
-                f"Size: ${position_size:.2f}\n"
-                f"Price: {price}"
+                f"🟢 *[PAPER TRADE OPENED]*\n\n"
+                f"`{market_id}`\n"
+                f"Action: *{action.upper()}*\n"
+                f"Size: `${position_size:.2f}`\n"
+                f"Entry Price: `{price:.4f}`\n"
+                f"BTC: `${btc_price:.0f}`"
             )
 
         return trade

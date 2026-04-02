@@ -1,6 +1,10 @@
+import time
 from src.db.sqlite_handler import db
 from src.llm.minimax_client import MiniMaxClient
 from config.config import LLM_MIN_CONFIDENCE, LLM_EDGE_THRESHOLD
+
+
+PM_CHANGE_THRESHOLD = 0.02  # 2% price change in Polymarket triggers signal
 
 
 class SignalEngine:
@@ -9,6 +13,8 @@ class SignalEngine:
         self.latency_detector = latency_detector
         self.telegram_bot = telegram_bot
         self.signal_history = []
+        self._btc_history = []
+        self._pm_price_history = {}  # {market_id: [(timestamp, price), ...]}
 
     def check_opportunity(self, btc_data, polymarket_data, llm_result=None):
         signals = []
@@ -16,12 +22,32 @@ class SignalEngine:
         primary_signal = None
         action = "no_trade"
 
+        btc_price = btc_data.get("btc_price")
+        if btc_price:
+            self._btc_history.append({"price": btc_price, "time": time.time()})
+            if len(self._btc_history) > 20:
+                self._btc_history = self._btc_history[-20:]
+
         if self.latency_detector:
             latency_signal = self._check_latency_signal(btc_data, polymarket_data)
             if latency_signal:
                 signals.append(latency_signal)
                 priority = "HIGH"
                 primary_signal = latency_signal
+
+        momentum_signal = self._check_momentum_signal(polymarket_data)
+        if momentum_signal:
+            signals.append(momentum_signal)
+            if priority != "HIGH":
+                priority = "MEDIUM"
+                primary_signal = momentum_signal
+
+        pm_signal = self._check_polymarket_momentum_signal(polymarket_data)
+        if pm_signal:
+            signals.append(pm_signal)
+            if priority != "HIGH":
+                priority = "MEDIUM"
+                primary_signal = pm_signal
 
         if llm_result and llm_result.get("recommended_action") != "no_trade":
             llm_signal = self._check_llm_signal(llm_result)
@@ -44,7 +70,7 @@ class SignalEngine:
             "priority": priority,
             "signals": signals,
             "action": action,
-            "btc_price": btc_data.get("btc_price"),
+            "btc_price": btc_price,
             "market_id": polymarket_data.get("market_id"),
             "polymarket_price": polymarket_data.get("price_yes"),
         }
@@ -81,6 +107,122 @@ class SignalEngine:
                     "confidence": 0.8,
                     "edge": result / 100,
                 }
+
+        return None
+
+    def _check_momentum_signal(self, polymarket_data):
+        if len(self._btc_history) < 2:
+            return None
+
+        recent = self._btc_history[-1]
+        prev = self._btc_history[-2] if len(self._btc_history) > 1 else recent
+
+        current_price = recent.get("price", 0)
+        current_high = recent.get("high", current_price)
+        current_low = recent.get("low", current_price)
+        prev_price = prev.get("price", 0)
+
+        if not current_price or not prev_price:
+            return None
+
+        change_pct = (current_price - prev_price) / prev_price * 100
+
+        if abs(change_pct) < 0.3:
+            return None
+
+        market_price = polymarket_data.get("price_yes", 0.5)
+        question = polymarket_data.get("market_question", "").lower()
+
+        btc_mentioned = any(
+            x in question
+            for x in [
+                "btc",
+                "bitcoin",
+                "64",
+                "66",
+                "68",
+                "70",
+                "72",
+                "74",
+                "76",
+                "78",
+                "80",
+            ]
+        )
+
+        if not btc_mentioned:
+            return None
+
+        if change_pct > 0.3 and market_price < 0.6:
+            return {
+                "type": "momentum",
+                "direction": "up",
+                "action": "buy_yes",
+                "confidence": 0.6,
+                "edge": change_pct / 100,
+            }
+        elif change_pct < -0.3 and market_price > 0.4:
+            return {
+                "type": "momentum",
+                "direction": "down",
+                "action": "buy_no",
+                "confidence": 0.6,
+                "edge": abs(change_pct) / 100,
+            }
+
+        return None
+
+    def _check_polymarket_momentum_signal(self, polymarket_data):
+        market_id = polymarket_data.get("market_id")
+        current_price = polymarket_data.get("price_yes", 0)
+        question = polymarket_data.get("market_question", "").lower()
+        current_time = time.time()
+
+        if not market_id or not current_price:
+            return None
+
+        if market_id not in self._pm_price_history:
+            self._pm_price_history[market_id] = []
+
+        history = self._pm_price_history[market_id]
+        history.append({"price": current_price, "time": current_time})
+
+        if len(history) > 30:
+            history = history[-30:]
+            self._pm_price_history[market_id] = history
+
+        if len(history) < 3:
+            return None
+
+        recent = history[-1]["price"]
+        oldest = history[0]["price"]
+
+        if not oldest or oldest == 0:
+            return None
+
+        change_pct = (recent - oldest) / oldest
+
+        if abs(change_pct) < PM_CHANGE_THRESHOLD:
+            return None
+
+        market_price = polymarket_data.get("price_yes", 0.5)
+
+        if change_pct > PM_CHANGE_THRESHOLD and 0.15 < market_price < 0.85:
+            return {
+                "type": "pm_momentum",
+                "direction": "up",
+                "action": "buy_yes",
+                "confidence": 0.55,
+                "edge": change_pct,
+            }
+        elif change_pct < -PM_CHANGE_THRESHOLD and 0.15 < market_price < 0.85:
+            return {
+                "type": "pm_momentum",
+                "direction": "down",
+                "action": "buy_no",
+                "confidence": 0.55,
+                "edge": abs(change_pct),
+            }
 
         return None
 

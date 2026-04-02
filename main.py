@@ -6,13 +6,17 @@ import signal
 from datetime import datetime
 from dotenv import load_dotenv
 
+# IMPORTANT: load_dotenv() MUST be called BEFORE importing config modules
+# so that env vars (TELEGRAM_BOT_TOKEN, etc.) are available at import time
+load_dotenv()
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.config import LATENCY_THRESHOLD_PCT, LLM_ANALYSIS_INTERVAL_MINUTES, DB_PATH
 from config.telegram_config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from src.db.sqlite_handler import SQLiteHandler
 from src.data_collector.polymarket_client import PolymarketClient
-from src.data_collector.btc_websocket import BTCWebSocket
+from src.data_collector.btc_chainlink import BTCCollector
 from src.latency_detector.latency_analyzer import LatencyDetector
 from src.llm.minimax_client import MiniMaxClient
 from src.monitoring.telegram_bot import TelegramBot
@@ -21,8 +25,6 @@ from src.engine.risk_manager import RiskManager
 from src.engine.backtester import Backtester
 from src.engine.paper_trading_engine import PaperTradingEngine
 from src.engine.pro_trading_engine import ProTradingEngine
-
-load_dotenv()
 
 TRADING_MODES = {
     "FREE": "FREE MODE - Data collection only",
@@ -44,6 +46,7 @@ class TradingEngine:
         self.trading_engine = None
         self.running = False
         self.start_time = time.time()
+        self._latest_llm_results = {}  # {market_id: llm_result}
 
         print(f"\n{'=' * 60}")
         print(f"POLYMARKET TRADING ENGINE")
@@ -68,8 +71,8 @@ class TradingEngine:
         self.polymarket_client = PolymarketClient()
         print("[Engine] Polymarket client ready")
 
-        self.btc_ws = BTCWebSocket()
-        print("[Engine] BTC WebSocket ready")
+        self.btc_ws = BTCCollector(interval_seconds=60)
+        print("[Engine] BTC Chainlink collector ready")
 
         self.latency_detector = LatencyDetector(telegram_bot=self.telegram_bot)
         print("[Engine] Latency detector ready")
@@ -89,11 +92,19 @@ class TradingEngine:
         else:
             print("[Engine] WARNING: MiniMax not configured - LLM analysis disabled")
 
+        if not self.signal_engine:
+            self.signal_engine = SignalEngine(
+                llm_client=self.llm_client,
+                latency_detector=self.latency_detector,
+                telegram_bot=self.telegram_bot,
+            )
+
         if self.mode == "PAPER":
             self.trading_engine = PaperTradingEngine(
                 initial_capital=10000,
                 telegram_bot=self.telegram_bot,
                 minimax_client=self.llm_client,
+                signal_engine=self.signal_engine,
             )
         elif self.mode == "PRO":
             polymarket_api_key = os.getenv("POLYMARKET_API_KEY", "")
@@ -104,13 +115,6 @@ class TradingEngine:
                 minimax_client=self.llm_client,
                 api_key=polymarket_api_key,
                 api_secret=polymarket_api_secret,
-            )
-
-        if self.trading_engine:
-            self.signal_engine = SignalEngine(
-                llm_client=self.llm_client,
-                latency_detector=self.latency_detector,
-                telegram_bot=self.telegram_bot,
             )
 
         print("[Engine] All components initialized")
@@ -136,13 +140,22 @@ class TradingEngine:
                 )
 
             if self.mode != "FREE" and self.signal_engine and btc_price:
+                # Pass latest LLM result for this market if available
+                market_id = data.get("market_id", "")
+                llm_result = self._latest_llm_results.get(market_id)
+
                 signal = self.signal_engine.check_opportunity(
                     btc_data={"btc_price": btc_price, "timestamp_ms": btc_ts},
                     polymarket_data=data,
+                    llm_result=llm_result,
                 )
 
-                if self.mode == "PAPER" and signal["priority"] == "HIGH":
+                if signal["priority"] == "HIGH" and self.trading_engine:
                     self.trading_engine.execute_signal(signal)
+                elif signal["priority"] == "MEDIUM" and self.trading_engine:
+                    # Also execute MEDIUM priority signals in PAPER mode for more action
+                    if self.mode == "PAPER":
+                        self.trading_engine.execute_signal(signal)
 
         except Exception as e:
             print(f"[Engine] Error processing polymarket data: {e}")
@@ -157,15 +170,19 @@ class TradingEngine:
 
     def _llm_analysis_loop(self):
         print("[Engine] LLM analysis loop started")
+        # Wait a shorter initial period to start analyzing sooner
+        initial_wait = min(LLM_ANALYSIS_INTERVAL_MINUTES * 60, 120)  # max 2 min first wait
+        time.sleep(initial_wait)
+
         while self.running:
             try:
-                time.sleep(LLM_ANALYSIS_INTERVAL_MINUTES * 60)
-
                 if not self.llm_client or not self.running:
+                    time.sleep(30)
                     continue
 
                 markets = self.db.get_pending_markets_for_analysis(limit=10)
                 if not markets:
+                    time.sleep(LLM_ANALYSIS_INTERVAL_MINUTES * 60)
                     continue
 
                 print(f"[Engine] Analyzing {len(markets)} markets...")
@@ -196,15 +213,41 @@ class TradingEngine:
                             recommended_action=result["recommended_action"],
                         )
 
+                        # Store latest LLM result so signal engine can use it
+                        self._latest_llm_results[market_id] = result
+
                         self.llm_client.check_and_alert_opportunity(result)
                         print(
-                            f"[Engine] Analyzed {market_id}: edge={result['edge']:.2%}"
+                            f"[Engine] Analyzed {market_id}: edge={result['edge']:.2%}, action={result['recommended_action']}"
                         )
+
+                        # If in trading mode, immediately generate signal from LLM result
+                        if self.mode != "FREE" and self.signal_engine and self.trading_engine:
+                            btc_data = {"btc_price": btc_price, "timestamp_ms": int(time.time() * 1000)}
+                            pm_data = {
+                                "market_id": market_id,
+                                "market_question": question,
+                                "price_yes": price_yes,
+                                "price_no": 1 - price_yes,
+                                "timestamp_ms": int(time.time() * 1000),
+                            }
+                            signal = self.signal_engine.check_opportunity(
+                                btc_data=btc_data,
+                                polymarket_data=pm_data,
+                                llm_result=result,
+                            )
+                            if signal["priority"] in ("HIGH", "MEDIUM"):
+                                print(f"[Engine] LLM signal: {signal['priority']} - {signal['action']} on {market_id}")
+                                self.trading_engine.execute_signal(signal)
 
                     time.sleep(2)
 
+                # Wait before next analysis cycle
+                time.sleep(LLM_ANALYSIS_INTERVAL_MINUTES * 60)
+
             except Exception as e:
                 print(f"[Engine] LLM analysis error: {e}")
+                time.sleep(30)
 
     def _register_signal_handlers(self):
         def signal_handler(sig, frame):

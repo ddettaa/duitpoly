@@ -31,6 +31,10 @@ class BTCWebSocket:
         print("[BTC WS] Stopped")
 
     def _run_ws(self):
+        reconnect_delay = 1
+        max_reconnect_delay = 30
+        consecutive_errors = 0
+
         while self.running:
             try:
                 self.ws = websocket.WebSocketApp(
@@ -40,10 +44,27 @@ class BTCWebSocket:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self.ws.run_forever(ping_interval=30)
+                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+
+                if self.running:
+                    consecutive_errors += 1
+                    if consecutive_errors <= 3:
+                        print(
+                            f"[BTC WS] Disconnected, retrying in {reconnect_delay}s..."
+                        )
+                    time.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                else:
+                    break
+
             except Exception as e:
-                print(f"[BTC WS] Error: {e}")
-                time.sleep(5)
+                consecutive_errors += 1
+                if consecutive_errors <= 3:
+                    print(f"[BTC WS] Error: {e}, retrying...")
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+        print("[BTC WS] Stopped")
 
     def _on_open(self, ws):
         print("[BTC WS] Connected")
@@ -66,10 +87,16 @@ class BTCWebSocket:
             print(f"[BTC WS] Parse error: {e}")
 
     def _on_error(self, ws, error):
-        print(f"[BTC WS] WebSocket error: {error}")
+        if self.running:
+            error_str = str(error)
+            if "10060" in error_str or "WSAEWOULDBLOCK" in error_str:
+                pass
+            else:
+                print(f"[BTC WS] Error: {error}")
 
     def _on_close(self, ws, close_status_code, close_msg):
-        print(f"[BTC WS] Closed: {close_status_code}")
+        if self.running and close_status_code != 1000:
+            print(f"[BTC WS] Connection closed (code: {close_status_code})")
 
     def get_last_price(self):
         return self.last_price, self.last_timestamp_ms

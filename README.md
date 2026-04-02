@@ -140,15 +140,15 @@ A sophisticated trading system that combines **slow intelligence (LLM)** for mar
     ┌──────────────────────────────────────────────────────────┐
     │                    Polymarket Client                     │
     │                                                           │
-    │   API Endpoint: https://clob.polymarket.com             │
+    │   API Endpoint: https://gamma-api.polymarket.com        │
     │   Poll Interval: 500ms                                  │
-    │   Filter: Crypto markets only                            │
+    │   Filter: Crypto markets only (BTC, ETH, SOL, etc.)     │
     │                                                           │
     │   Methods:                                                │
     │   ├── get_markets(limit=20)                             │
     │   │       → Returns active markets                       │
     │   ├── get_crypto_markets(limit=50)                      │
-    │   │       → Filters by tags: crypto, defi, bitcoin...    │
+    │   │       → Filters by keywords: btc, eth, crypto...     │
     │   ├── get_market_price(market_id)                       │
     │   │       → Returns current price, volume, liquidity     │
     │   └── start_polling(callback)                            │

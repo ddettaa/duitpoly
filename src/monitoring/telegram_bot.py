@@ -17,14 +17,17 @@ class TelegramBot:
 
     def send_message(self, text, parse_mode="Markdown"):
         if not self.bot_token or not self.chat_id:
-            print(f"[Telegram] Bot not configured. Message: {text}")
+            print(f"[Telegram] Bot not configured.")
             return False
 
         try:
             url = f"{self.base_url}/sendMessage"
             payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
             response = requests.post(url, json=payload, timeout=10)
-            return response.status_code == 200
+            result = response.json()
+            if not result.get("ok"):
+                print(f"[Telegram] API error: {result}")
+            return result.get("ok", False)
         except Exception as e:
             print(f"[Telegram] Send error: {e}")
             return False
